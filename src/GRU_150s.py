@@ -20,6 +20,7 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+
 # === Dataset class ===
 class ThermalDataset(Dataset):
     def __init__(self, csv_file, scaler=None):
@@ -31,6 +32,8 @@ class ThermalDataset(Dataset):
             "T_ave (C)": "T_avg (C)",
         }
         df.rename(columns=rename_map, inplace=True)
+        if "Input Temperature (C)" not in df.columns and "T_inner (C)" in df.columns:
+            df["Input Temperature (C)"] = df["T_inner (C)"]
         if scaler is None:
             self.scaler = MinMaxScaler()
             self.scaler.fit(df[columns_for_scaling])
@@ -73,6 +76,7 @@ class ThermalDataset(Dataset):
             self.full_t_min[idx], self.full_t_max[idx], self.full_t_ave[idx]
         )
 
+
 # === Model definition ===
 class ThermalGRU(nn.Module):
     def __init__(self, input_size=4, hidden_size=128, output_size=3, num_layers=5):
@@ -91,6 +95,7 @@ class ThermalGRU(nn.Module):
         device = next(self.parameters()).device
         return torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
 
+
 # === Weighted loss ===
 def weighted_loss(predictions, targets, weights=torch.tensor([1.0, 1.0, 1.0]), time_weights=None):
     weights = weights.to(predictions.device)
@@ -100,34 +105,63 @@ def weighted_loss(predictions, targets, weights=torch.tensor([1.0, 1.0, 1.0]), t
         loss = loss * time_weights.unsqueeze(-1)
     return torch.mean(loss)
 
+
 # === Training function ===
 def train_model():
-
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    src_dir = os.path.dirname(script_dir)
-    project_root = os.path.dirname(src_dir)
-    data_dir = os.path.join(project_root, "Data Group")
 
-    # ==== Load CSV files from train and test folders ====
-    # Use fixed dataset: 150s without burn_in
-    fixed_data_dir = os.path.join(project_root, "fixed", "data")
-    fixed_test_dir = os.path.join(project_root, "fixed", "test_with_inputs")
-    train_dir = os.path.join(fixed_data_dir, "data_in_150s")
-    test_dir = os.path.join(fixed_test_dir, "test_in_150s")
-    
-    # Fallback to Data Group if fixed doesn't exist
-    if not os.path.isdir(train_dir):
-        train_dir = os.path.join(data_dir, "data_in_150s")
-    if not os.path.isdir(test_dir):
-        test_dir = os.path.join(data_dir, "test_in_150s")
-    
+    possible_data_dirs = [
+        os.path.normpath(os.path.join(script_dir, "..", "data")),   # 根/data
+        os.path.join(script_dir, "data"),                           # src/data
+        os.path.abspath(os.path.join(os.getcwd(), "data")),         # 工作目录/data
+    ]
+
+    data_dir = next((p for p in possible_data_dirs if os.path.isdir(p)), None)
+    print("script_dir =", script_dir)
+    print("checked data roots =", possible_data_dirs)
+    print("selected data_dir =", data_dir)
+
+    if not data_dir:
+        print("Data directory not found")
+        return None, None
+
+    # 兼容不同目录名
+    train_candidates = [
+        os.path.join(data_dir, "150s Time steps"),
+        os.path.join(data_dir, "data_in_150s"),
+    ]
+    test_candidates = [
+        os.path.join(data_dir, "test"),
+        os.path.join(data_dir, "test_in_150s"),
+    ]
+    train_dir = next((p for p in train_candidates if os.path.isdir(p)), None)
+    test_dir  = next((p for p in test_candidates  if os.path.isdir(p)), None)
+
+    print("selected train_dir =", train_dir)
+    print("selected test_dir  =", test_dir)
+
+    # 在选出 train_dir / test_dir 之后，立刻枚举文件
     train_paths = sorted(glob.glob(os.path.join(train_dir, "**", "*.csv"), recursive=True))
-    test_paths = sorted(glob.glob(os.path.join(test_dir, "*.csv")))
+    test_paths  = sorted(glob.glob(os.path.join(test_dir, "*.csv"))) if test_dir else []
+
+    print(f"Found training files: {len(train_paths)}")
+    print(f"Found test files: {len(test_paths)}")
+
+    if not train_paths:
+        print("No training files found")
+        return None, None
+
+    if not train_dir:
+        print("No training dir. Tried:", train_candidates)
+        return None, None
+    if not test_dir:
+        print("No test dir. Tried:", test_candidates)
+        test_dir = None
 
     # === Split out validation set (optional 5%) ===
-    val_split = int(0.05 * len(train_paths))
-    val_paths = train_paths[:val_split]
-    actual_train_paths = train_paths[val_split:]
+    val_split = max(1, int(0.05 * len(train_paths))) if len(train_paths) > 1 else 0
+    val_paths = train_paths[:val_split] if val_split > 0 else []
+    actual_train_paths = train_paths[val_split:] if val_split > 0 else train_paths
 
     # === Fit a unified scaler on training data ===
     train_dfs = [pd.read_csv(f) for f in actual_train_paths]
@@ -136,10 +170,10 @@ def train_model():
 
     train_datasets = [ThermalDataset(f, scaler=scaler) for f in actual_train_paths]
     val_datasets = [ThermalDataset(f, scaler=scaler) for f in val_paths]
-    test_datasets = [ThermalDataset(f, scaler=scaler) for f in test_paths]
+    test_datasets = [ThermalDataset(f, scaler=scaler) for f in test_paths] if test_paths else []
 
     train_loader = DataLoader(ConcatDataset(train_datasets), batch_size=16, shuffle=True)
-    val_loader = DataLoader(ConcatDataset(val_datasets), batch_size=16)
+    val_loader = DataLoader(ConcatDataset(val_datasets), batch_size=16) if val_datasets else None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ThermalGRU().to(device)
@@ -168,7 +202,8 @@ def train_model():
             batch_loss = 0.0
 
             for t in range(seq_len):
-                input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave], dim=1).unsqueeze(1)
+                input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave],
+                                      dim=1).unsqueeze(1)
                 delta, hidden = model(input_t, hidden)
                 # Now output is [T_inner, T_outer, T_avg] (3 values)
                 output = delta[:, 0]  # [T_inner, T_outer, T_avg] (3 values)
@@ -178,43 +213,52 @@ def train_model():
                     use_teacher = (torch.rand(batch_size, device=device) < 0.5).float()
                     ground_truth = inputs[:, t + 1, 1:4]  # [T_outer, Input_Temp, T_avg]
                     # output is [T_inner, T_outer, T_avg]
-                    current_t_min = use_teacher * ground_truth[:, 0] + (1 - use_teacher) * output[:, 1]  # T_outer from output[1]
+                    current_t_min = use_teacher * ground_truth[:, 0] + (1 - use_teacher) * output[
+                        :, 1]  # T_outer from output[1]
                     current_input_temp = inputs[:, t + 1, 2]  # Use next Input Temperature
-                    current_t_ave = use_teacher * ground_truth[:, 2] + (1 - use_teacher) * output[:, 2]  # T_avg from output[2]
+                    current_t_ave = use_teacher * ground_truth[:, 2] + (1 - use_teacher) * output[
+                        :, 2]  # T_avg from output[2]
 
             (batch_loss / seq_len).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_train_loss += batch_loss.item() / seq_len
 
-        model.eval()
-        with torch.no_grad():
-            val_loss = 0
-            for val_batch in val_loader:
-                inputs, targets, *_ = [b.to(device) if torch.is_tensor(b) else b for b in val_batch]
-                hidden = model.init_hidden(inputs.size(0))
-                if burn_in_steps > 0 and seq_len > burn_in_steps:
-                    _, hidden = model(inputs[:, :burn_in_steps], hidden)
-                current_t_min = inputs[:, 0, 1]  # T_outer
-                current_input_temp = inputs[:, 0, 2]  # Input Temperature
-                current_t_ave = inputs[:, 0, 3]  # T_avg
-                batch_val_loss = 0
-                for t in range(seq_len):
-                    input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave], dim=1).unsqueeze(1)
-                    delta, hidden = model(input_t, hidden)
-                    output = delta[:, 0]  # [T_inner, T_outer, T_avg] (3 values)
-                    loss_t = weighted_loss(output, targets[:, t])
+        # —— 验证阶段 ——
+        if val_loader:
+            model.eval()
+            with torch.no_grad():
+                val_loss = 0.0
+                for val_batch in val_loader:
+                    inputs, targets, *_ = [b.to(device) if torch.is_tensor(b) else b for b in val_batch]
+                    seq_len = inputs.size(1)
+                    hidden = model.init_hidden(inputs.size(0))
+                    if burn_in_steps > 0 and seq_len > burn_in_steps:
+                        _, hidden = model(inputs[:, :burn_in_steps], hidden)
+                    current_t_min = inputs[:, 0, 1]
+                    current_input_temp = inputs[:, 0, 2]
+                    current_t_ave = inputs[:, 0, 3]
+                    batch_val_loss = 0.0
+                    for t in range(seq_len):
+                        input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave],
+                                              dim=1).unsqueeze(1)
+                        delta, hidden = model(input_t, hidden)
+                        output = delta[:, 0]
+                        loss_t = weighted_loss(output, targets[:, t])
+                        batch_val_loss += loss_t
+                        if t < seq_len - 1:
+                            current_t_min = inputs[:, t + 1, 1]
+                            current_input_temp = inputs[:, t + 1, 2]
+                            current_t_ave = inputs[:, t + 1, 3]
+                    val_loss += batch_val_loss.item() / seq_len
+            ave_val_loss = val_loss / len(val_loader)
+            scheduler.step(ave_val_loss)
+        else:
+            ave_val_loss = total_train_loss / max(1, len(train_loader))
+            scheduler.step(ave_val_loss)
 
-                    batch_val_loss += loss_t
-                    if t < seq_len - 1:
-                        current_t_min = inputs[:, t + 1, 1]  # T_outer
-                        current_input_temp = inputs[:, t + 1, 2]  # Input Temperature
-                        current_t_ave = inputs[:, t + 1, 3]  # T_avg
-                val_loss += batch_val_loss.item() / seq_len
-
-        ave_val_loss = val_loss / len(val_loader)
-        scheduler.step(ave_val_loss)
-        print(f"[Epoch {epoch+1}] Train Loss: {total_train_loss/len(train_loader):.4f}, Val Loss: {ave_val_loss:.4f}")
+        print(f"[Epoch {epoch + 1}] Train Loss: {total_train_loss / len(train_loader):.4f}, "
+              f"Val Loss: {ave_val_loss:.4f}")
 
         if ave_val_loss < best_val_loss:
             best_val_loss = ave_val_loss
@@ -229,41 +273,48 @@ def train_model():
     model.load_state_dict(torch.load(os.path.join(script_dir, "best_gru.pth")))
     return model, test_datasets
 
+
 # === Testing function ===
 def test_model(model, test_datasets):
+    if model is None or not test_datasets:
+        print("Model or dataset is empty");
+        return
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
-    
-    # Create output directory for saving plots
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_dir = os.path.join(script_dir, "GRU_without_burn_in")
     os.makedirs(output_dir, exist_ok=True)
-    
+
     print(f"\nTesting on {len(test_datasets)} test cases...")
     for idx, dataset in enumerate(test_datasets):
         file = os.path.basename(dataset.file_name)
-        print(f"Processing test case {idx+1}/{len(test_datasets)}: {file}")
+        print(f"Processing test case {idx + 1}/{len(test_datasets)}: {file}")
         x, _, _, ft, ft_min, ft_max, ft_ave = dataset[0]
         x = x.to(device)
         hidden = model.init_hidden(1)
-        current_t_min = x[0, 1]  # T_outer
-        current_input_temp = x[0, 2]  # Input Temperature
-        current_t_ave = x[0, 3]  # T_avg
+
+        # 只使用第一个时间步的实际温度值作为初始条件
+        current_t_min = x[0, 1]  # 初始 T_outer
+        current_t_ave = x[0, 3]  # 初始 T_avg
         preds = []
 
         for t in range(x.shape[0]):
-            input_t = torch.tensor([[x[t, 0], current_t_min, current_input_temp, current_t_ave]], dtype=torch.float32).unsqueeze(0).to(device)
+            # 只使用 Input Temperature 作为输入（从数据中读取）
+            current_input_temp = x[t, 2]  # 每个时间步的 Input Temperature
+
+            input_t = torch.tensor([[x[t, 0], current_t_min, current_input_temp, current_t_ave]],
+                                   dtype=torch.float32).unsqueeze(0).to(device)
             with torch.no_grad():
                 delta, hidden = model(input_t, hidden)
-                output = delta[0, 0]  # [T_inner, T_outer, T_avg] (3 values)
+                output = delta[0, 0]  # [T_inner, T_outer, T_avg]
                 pred = output.cpu().numpy()
                 preds.append(pred)
-                if t < x.shape[0] - 1:
-                    # Always use predicted values for next time step
-                    # output is [T_inner, T_outer, T_avg]
-                    current_t_min = pred[1]  # Use predicted T_outer
-                    current_input_temp = x[t + 1, 2]  # Use next Input Temperature
-                    current_t_ave = pred[2]  # Use predicted T_avg
+
+                # 完全使用预测值更新（不再使用实际值）
+                current_t_min = pred[1]  # 使用预测的 T_outer
+                current_t_ave = pred[2]  # 使用预测的 T_avg
+                # current_input_temp 会在下一次循环从 x[t+1, 2] 读取
 
         pred_seq = np.array(preds)
 
@@ -272,24 +323,24 @@ def test_model(model, test_datasets):
         # Note: pred_seq corresponds to predictions at time indices 1 to len(pred_seq)
         # Use ft[1:] to match prediction length
         dummy_actual = np.zeros((len(pred_seq), 5))
-        dummy_actual[:, 0] = ft[1:len(pred_seq)+1]  # Time (from index 1 to len(pred_seq))
-        dummy_actual[:, 1] = ft_min[1:len(pred_seq)+1]  # T_outer  
-        dummy_actual[:, 2] = ft_max[1:len(pred_seq)+1]  # T_inner
-        dummy_actual[:, 3] = ft_ave[1:len(pred_seq)+1]  # T_avg
-        
+        dummy_actual[:, 0] = ft[1:len(pred_seq) + 1]  # Time (from index 1 to len(pred_seq))
+        dummy_actual[:, 1] = ft_min[1:len(pred_seq) + 1]  # T_outer
+        dummy_actual[:, 2] = ft_max[1:len(pred_seq) + 1]  # T_inner
+        dummy_actual[:, 3] = ft_ave[1:len(pred_seq) + 1]  # T_avg
+
         # Need to add Input Temperature - get from x (input data)
         # x has columns: Time, T_outer, Input_Temp, T_avg
         dummy_actual[:, 4] = x[:, 2].cpu().numpy()  # Input Temperature
-        
+
         # Predictions: pred_seq[:, 0]=T_inner, pred_seq[:, 1]=T_outer, pred_seq[:, 2]=T_avg
         # pred_seq corresponds to predictions at time indices 1 to n-1
         dummy_pred = np.zeros((len(pred_seq), 5))
-        dummy_pred[:, 0] = ft[1:len(pred_seq)+1]  # Time (from index 1 to n-1)
+        dummy_pred[:, 0] = ft[1:len(pred_seq) + 1]  # Time (from index 1 to n-1)
         dummy_pred[:, 1] = pred_seq[:, 1]  # T_outer prediction
         dummy_pred[:, 2] = pred_seq[:, 0]  # T_inner prediction
         dummy_pred[:, 3] = pred_seq[:, 2]  # T_avg prediction
         dummy_pred[:, 4] = x[:, 2].cpu().numpy()  # Input Temperature (use actual)
-        
+
         inv_pred = dataset.scaler.inverse_transform(dummy_pred)
         inv_actual = dataset.scaler.inverse_transform(dummy_actual)
 
@@ -308,23 +359,27 @@ def test_model(model, test_datasets):
         plt.ylabel("Temperature (C)")
         plt.title(f"Prediction - {file}")
         plt.legend()
-        
+
         # Add MAE text to the plot
         mae_text = f"MAE: T_inner={mae_inner:.3f}°C, T_outer={mae_outer:.3f}°C, T_avg={mae_avg:.3f}°C"
         plt.text(0.02, 0.98, mae_text, transform=plt.gca().transAxes,
-                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
-                fontsize=9)
+                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+                 fontsize=9)
         plt.tight_layout()
-        
+
         # Save plot instead of showing
         output_path = os.path.join(output_dir, f"plot_{file}.png")
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()  # Close the figure to avoid displaying
         print(f"  -> Saved to: {output_path}")
-    
+
     print(f"\nAll plots saved to: {output_dir}")
+
 
 # === Main entry ===
 if __name__ == "__main__":
     model, test_sets = train_model()
+    if model is None or not test_sets:
+        print("Model or dataset is empty. Exit.");
+        raise SystemExit(1)
     test_model(model, test_sets)

@@ -1,4 +1,4 @@
-Time (s),T_outer (C),T_inner (C),T_ave (C),Input Temperature (C)
+Time (s),T_outer (C),T_inner (C),T_avg (C),Input Temperature (C)
 0,200.0,200.0,200.0,200.0
 150,200.0,201.6,200.17,201.66666666666663
 300,200.0,203.24,200.42,203.33333333333337

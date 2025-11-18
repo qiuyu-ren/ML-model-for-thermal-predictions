@@ -33,14 +33,15 @@ class UpdatedThermalDataset(Dataset):
 
         if os.path.exists(cache_file):
             try:
-                cached = torch.load(cache_file)
+                # need to set weights_only = True to suppress warning
+                cached = torch.load(cache_file, weights_only=False)
                 self.X = cached["X"]
                 self.Y = cached["Y"]
                 self.external_conditions = cached["external"]
                 self.time_values = cached["time"]
                 self.full_data = cached["full"]
                 self.scaler = cached["scaler"]
-                print(f"[CACHE] Loaded {self.file_name} from cache")
+                # print(f"[CACHE] Loaded {self.file_name} from cache")
                 return  # Skip CSV parsing and windowing
             except Exception as e:
                 print(f"[CACHE] Failed to load cache for {self.file_name}: {e}")
@@ -142,13 +143,13 @@ class UpdatedThermalDataset(Dataset):
                 self.Y = torch.tensor(np.array(self.Y), dtype=torch.float32)
                 self.external_conditions = torch.tensor(np.array(self.external_conditions), dtype=torch.float32)
                 self.time_values = np.array(self.time_values)
-                self.full_Data = np.array(self.full_data)
+                self.full_data = np.array(self.full_data)
             # Success
             UpdatedThermalDataset.log_status.append(
                 (self.file_name, "OK", original_cols, list(df.columns))
             )
 
-            # # save to cache
+            # save to cache
             try:
                 torch.save({
                     "X": self.X,
@@ -158,7 +159,7 @@ class UpdatedThermalDataset(Dataset):
                     "full": self.full_data,
                     "scaler": self.scaler
                 }, cache_file)
-                print(f"[CACHE] Saved {self.file_name} to cache")
+                # print(f"[CACHE] Saved {self.file_name} to cache")
             except Exception as e:
                 print(f"[CACHE] Failed to save cache for {self.file_name}: {e}")
 
@@ -174,7 +175,7 @@ class UpdatedThermalDataset(Dataset):
         """Split the data sequence into overlapping windows"""
         X_list, Y_list = [], []
         total_steps = len(X_seq)
-        for start in range(0, total_steps - window_size, stride):
+        for start in range(0, total_steps - window_size + 1, stride):
             end = start + window_size
             X_list.append(X_seq[start:end])
             Y_list.append(Y_seq[start:end])
@@ -284,11 +285,15 @@ def train_updated_model():
     # Toggle Burn in
     use_burn_in = False
     if use_burn_in:
-        train_dir = os.path.join(data_dir, "data_in_10s_with_burn_in")
-        test_dir = os.path.join(data_dir, "test", "test_in_10s_with_burn_in")
+        train_dir = r"C:\Users\jshih\OneDrive\Desktop\ML-model-for-thermal-predictions-max\data\data\data_in_10s_with_burn_in"
+        test_dir = r"C:\Users\jshih\OneDrive\Desktop\ML-model-for-thermal-predictions-max\data\test\test_in_10s_with_burn_in"
+        #train_dir = os.path.join(data_dir, "src/models/data_in_10s_with_burn_in")
+        #test_dir = os.path.join(data_dir, "fixed", "/test/test_in_10s_with_burn_in")
     else:
-        train_dir = os.path.join(data_dir, "data_in_10s")
-        test_dir = os.path.join(data_dir, "test", "test_in_10s")
+        #train_dir = os.path.join(data_dir, "src/models/data_in_10s")
+        #test_dir = os.path.join(data_dir, "fixed", "/test/test_in_10s")
+        train_dir = r"C:\Users\jshih\OneDrive\Desktop\ML-model-for-thermal-predictions-max\data\data\data_in_10s"
+        test_dir = r"C:\Users\jshih\OneDrive\Desktop\ML-model-for-thermal-predictions-max\data\test\test_in_10s"
 
     # Confirm Directories
     print(f" Using training data from: {train_dir}")
@@ -367,9 +372,9 @@ def train_updated_model():
 
     # Window size, Stride pair
     window_configs = [
-        (64, 32),
-        (128, 64),
-        (256, 128)
+        #(32, 16),
+        (64, 32), # This is clearly the best sliding window parameters
+        #(128, 64),
     ]
 
     # Store best (window_size, stride, best_val_loss)
@@ -429,7 +434,7 @@ def train_updated_model():
         ) if val_datasets else None
 
         # Model and optimizer
-        device = torch.device("mps") # for mac / else use cuda for NVIDIA GPUs
+        device = torch.device("cuda") # for mac / else use cuda for NVIDIA GPUs
         model = UpdatedThermalGRU().to(device)
         optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=15)
@@ -501,6 +506,8 @@ def train_updated_model():
             # Early stopping check
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_model_state = model.state_dict()
+                best_window = window_size
                 torch.save(model.state_dict(), os.path.join(script_dir, "updated_best_gru.pth"))
                 early_stop_counter = 0
             else:
@@ -520,15 +527,17 @@ def train_updated_model():
     try:
         best_model = UpdatedThermalGRU()  # Recreate model structure
         best_model.load_state_dict(best_model_state)  # Load best weights
+        best_model.to(device)
+        best_model.eval()
         print("\n[INFO] Loaded best model based on validation loss.")
-        return best_model, test_datasets
+        return best_model, test_datasets, best_window
     except Exception as e:
         print(f"[WARN] Could not load best model: {e}")
         # otherwise return last trained model
-        return model, test_datasets
+        return model, test_datasets, best_window
 
 # === Testing function ===
-def test_updated_model(model, test_datasets):
+def test_updated_model(model, test_datasets, best_window):
     if not model or not test_datasets:
         print("Model or dataset is empty")
         return
@@ -592,13 +601,16 @@ def test_updated_model(model, test_datasets):
 
             pred_array = np.array(predictions)
 
-            # Inverse scaling for visualization
-            dummy_pred = np.zeros((len(pred_array), 5))
-            dummy_pred[:, 0] = full_data[1:len(pred_array) + 1, 0]  # Time
+            # === FIX ===
+            usable_len = min(len(pred_array), full_data.shape[0] - 1)
+            pred_array = pred_array[:usable_len]  # cut predictions if needed
+
+            dummy_pred = np.zeros((usable_len, 5))
+            dummy_pred[:, 0] = full_data[1:1 + usable_len, 0]  # safe, zero errors
             dummy_pred[:, 1] = pred_array[:, 0]  # T_outer prediction
             dummy_pred[:, 2] = pred_array[:, 1]  # T_inner prediction
             dummy_pred[:, 3] = pred_array[:, 2]  # T_avg prediction
-            dummy_pred[:, 4] = full_data[1:len(pred_array) + 1, 4]  # Input Temperature
+            dummy_pred[:, 4] = full_data[1:1 + usable_len, 4]  # Input Temperature
 
             inv_pred = dataset.scaler.inverse_transform(dummy_pred)
             inv_actual = dataset.scaler.inverse_transform(full_data)
@@ -612,7 +624,7 @@ def test_updated_model(model, test_datasets):
             plt.plot(inv_actual[:, 0], inv_actual[:, 2], 'r-', label='T_inner Actual', linewidth=2)
             plt.plot(inv_actual[:, 0], inv_actual[:, 3], 'g-', label='T_avg Actual', linewidth=2)
 
-            pred_times = inv_actual[1:len(inv_pred) + 1, 0]
+            pred_times = inv_actual[1:1 + len(inv_pred), 0]
             plt.plot(pred_times, inv_pred[:, 1], 'b--', label='T_outer Pred', linewidth=2, alpha=0.8)
             plt.plot(pred_times, inv_pred[:, 2], 'r--', label='T_inner Pred', linewidth=2, alpha=0.8)
             plt.plot(pred_times, inv_pred[:, 3], 'g--', label='T_avg Pred', linewidth=2, alpha=0.8)
@@ -632,8 +644,21 @@ def test_updated_model(model, test_datasets):
             plt.legend()
             plt.grid(True, alpha=0.3)
 
+            # === Create plot output directory ===
+            plot_dir = os.path.join(os.path.dirname(__file__), "plot_GRU_10s")
+            os.makedirs(plot_dir, exist_ok=True)
+
+            # Save filename: same as CSV name but PNG
+            png_name = file_name.replace(".csv", ".png")
+            png_path = os.path.join(plot_dir, png_name)
+
+            # Save plot
             plt.tight_layout()
+            plt.savefig(png_path, dpi=150)
+            print(f"[PLOT SAVED] {png_path}")
+
             plt.show()
+            plt.close()
 
             # Compute error
             actual_temps = inv_actual[1:len(inv_pred) + 1, 1:4]  # [T_outer, T_inner, T_avg]
@@ -655,11 +680,11 @@ if __name__ == "__main__":
     print("Start training thermal prediction model adapted for new data structure...")
 
     try:
-        model, test_datasets = train_updated_model()
+        model, test_datasets, best_window = train_updated_model()
 
         if model and test_datasets:
             print("Training finished, start testing...")
-            test_updated_model(model, test_datasets)
+            test_updated_model(model, test_datasets, best_window)
         else:
             print("Training failed")
 

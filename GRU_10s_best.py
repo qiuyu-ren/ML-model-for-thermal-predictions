@@ -20,13 +20,23 @@ torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+# Testing different model parameters - optimizing epochs
+# Adding dropout to reduce overfitting
+configs = [
+    {"hidden_size": 64, "num_layers": 3, "max_epochs":100, "dropout":0.1}, # Try a light-weight model compare if worth it
+    {"hidden_size": 128, "num_layers": 3, "max_epochs":100, "dropout": 0.2}, # Try less layers
+    {"hidden_size": 128, "num_layers": 5, "max_epochs":300, "dropout":0.2 }, # What has worked the best so far
+]
+
 # === Dataset class ===
 class ThermalDataset(Dataset):
     def __init__(self, csv_file, scaler=None):
         self.file_name = os.path.basename(csv_file)
         df = pd.read_csv(csv_file)
         df["FileName"] = self.file_name
-        columns_for_scaling = ['Time (s)', 'T_outer (C)', 'T_inner (C)', 'T_avg (C)', 'Input Temperature (C)']
+        columns_for_scaling = ['Time (s)',
+                               'T_outer (C)', 'T_inner (C)', 'T_avg (C)', 'Input Temperature (C)'
+                               ]
         rename_map = {
             "T_ave (C)": "T_avg (C)",
         }
@@ -37,13 +47,22 @@ class ThermalDataset(Dataset):
         else:
             self.scaler = scaler
         df[columns_for_scaling] = self.scaler.transform(df[columns_for_scaling])
+
+        # === Add derived delta features ===
+        df["dT_outer (C)"] = df["T_outer (C)"].diff().fillna(0)
+        # df["dT_inner"] = df["T_inner (C)"].diff().fillna(0)
+        df["dT_avg (C)"] = df["T_avg (C)"].diff().fillna(0)
+        df["dInput Temperature (C)"] = df["Input Temperature (C)"].diff().fillna(0)
+
         grouped = df.groupby("FileName")
         self.X, self.Y, self.time_values = [], [], []
         self.full_time, self.full_t_min, self.full_t_max, self.full_t_ave = [], [], [], []
 
         for _, group in grouped:
             # Input: Time, T_outer, Input Temperature, T_avg (replace T_inner with Input Temperature)
-            X_seq = group[["Time (s)", "T_outer (C)", "Input Temperature (C)", "T_avg (C)"]].values[:-1]
+            X_seq = group[["Time (s)",
+                           "T_outer (C)", "Input Temperature (C)", "T_avg (C)",
+                           "dT_outer (C)", "dInput Temperature (C)", "dT_avg (C)"]].values[:-1]
             # Output: T_inner, T_outer, T_avg (3 temperatures)
             Y_seq = group[["T_inner (C)", "T_outer (C)", "T_avg (C)"]].values[1:]
             time_vals = group["Time (s)"].values[1:]
@@ -75,11 +94,11 @@ class ThermalDataset(Dataset):
 
 # === Model definition ===
 class ThermalGRU(nn.Module):
-    def __init__(self, input_size=4, hidden_size=128, output_size=3, num_layers=5):
+    def __init__(self, input_size=7, hidden_size=128, output_size=3, num_layers=5, dropout=0.1):
         super(ThermalGRU, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        self.gru = nn.GRU(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, dropout=dropout, batch_first=True)
         self.fc = nn.Linear(hidden_size, output_size)
 
     def forward(self, x, hidden):
@@ -101,7 +120,7 @@ def weighted_loss(predictions, targets, weights=torch.tensor([1.0, 1.0, 1.0]), t
     return torch.mean(loss)
 
 # === Training function ===
-def train_model():
+def train_model(max_epochs = 300, hidden_size =128, num_layers=5, dropout=0.1):
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     src_dir = os.path.dirname(script_dir)
@@ -110,9 +129,9 @@ def train_model():
 
     # ==== Load CSV files from train and test folders ====
     # Use fixed dataset: 10s without burn_in
-    fixed_data_dir = os.path.join(project_root, "data", "train")
+    fixed_data_dir = os.path.join(project_root, "data")
     fixed_test_dir = os.path.join(project_root, "data", "test")
-    train_dir = os.path.join(fixed_data_dir, "data_in_10s")
+    train_dir = os.path.join(fixed_data_dir, "data_in_10s_with_burn_in")
     test_dir = os.path.join(fixed_test_dir, "test_in_10s")
     
     # Fallback to Data Group if fixed doesn't exist
@@ -141,15 +160,26 @@ def train_model():
     train_loader = DataLoader(ConcatDataset(train_datasets), batch_size=16, shuffle=True)
     val_loader = DataLoader(ConcatDataset(val_datasets), batch_size=16)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ThermalGRU().to(device)
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU")
+
+    model = ThermalGRU(
+        input_size=7,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+    ).to(device)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
 
     best_val_loss, early_stop_counter = float('inf'), 0
-    num_epochs, patience, burn_in_steps = 300, 300, 0
+    patience, burn_in_steps = 300, 0
 
-    for epoch in range(num_epochs):
+    for epoch in range(max_epochs):
         model.train()
         total_train_loss = 0
         for batch in train_loader:
@@ -168,7 +198,11 @@ def train_model():
             batch_loss = 0.0
 
             for t in range(seq_len):
-                input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave], dim=1).unsqueeze(1)
+                input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave,
+                                       inputs[:, t, 4],      # dT_outer
+                                       inputs[:, t, 5],      # dInput
+                                       inputs[:, t, 6],      # dT_avg
+                ], dim=1).unsqueeze(1)
                 delta, hidden = model(input_t, hidden)
                 # Now output is [T_inner, T_outer, T_avg] (3 values)
                 output = delta[:, 0]  # [T_inner, T_outer, T_avg] (3 values)
@@ -200,7 +234,11 @@ def train_model():
                 current_t_ave = inputs[:, 0, 3]  # T_avg
                 batch_val_loss = 0
                 for t in range(seq_len):
-                    input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave], dim=1).unsqueeze(1)
+                    input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave,
+                                           inputs[:, t, 4],  # dT_outer
+                                           inputs[:, t, 5],  # dInput
+                                           inputs[:, t, 6],  # dT_avg
+                                           ], dim=1).unsqueeze(1)
                     delta, hidden = model(input_t, hidden)
                     output = delta[:, 0]  # [T_inner, T_outer, T_avg] (3 values)
                     loss_t = weighted_loss(output, targets[:, t])
@@ -227,7 +265,7 @@ def train_model():
                 break
 
     model.load_state_dict(torch.load(os.path.join(script_dir, "best_gru.pth")))
-    return model, test_datasets
+    return model, test_datasets, best_val_loss
 
 # === Testing function ===
 def test_model(model, test_datasets):
@@ -236,7 +274,7 @@ def test_model(model, test_datasets):
     
     # Create output directory for saving plots
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_dir = os.path.join(script_dir, "plot_GRU_10s_without_burn_in")
+    output_dir = os.path.join(script_dir, "plot_GRU_10s_with_burn_in")
     os.makedirs(output_dir, exist_ok=True)
     
     # print(f"\nTesting on {len(test_datasets)} test cases...")
@@ -252,7 +290,15 @@ def test_model(model, test_datasets):
         preds = []
 
         for t in range(x.shape[0]):
-            input_t = torch.tensor([[x[t, 0], current_t_min, current_input_temp, current_t_ave]], dtype=torch.float32).unsqueeze(0).to(device)
+            input_t = torch.tensor([[
+                x[t, 0],  # Time
+                current_t_min,
+                current_input_temp,
+                current_t_ave,
+                x[t, 4],  # dT_outer
+                x[t, 5],  # dInput Temperature
+                x[t, 6],  # dT_avg
+            ]], dtype=torch.float32).unsqueeze(0).to(device)
             with torch.no_grad():
                 delta, hidden = model(input_t, hidden)
                 output = delta[0, 0]  # [T_inner, T_outer, T_avg] (3 values)
@@ -325,5 +371,32 @@ def test_model(model, test_datasets):
 
 # === Main entry ===
 if __name__ == "__main__":
-    model, test_sets = train_model()
-    test_model(model, test_sets)
+    global best_config, best_model
+    best_val_loss = float("inf")
+    global best_test_sets
+
+    results = []
+
+    for cfg in configs:
+        print(f"Running Config: {cfg}")
+        # Train using config parameters
+        model, test_sets, val_mae = train_model(
+            max_epochs=cfg["max_epochs"],
+            hidden_size=cfg["hidden_size"],
+            num_layers=cfg["num_layers"],
+            dropout=cfg["dropout"]
+        )
+
+        if val_mae < best_val_loss:
+            best_val_loss = val_mae
+            best_config = cfg
+            best_model = model
+            best_test_sets = test_sets
+
+        print(f"Validation MAE for this configuration: {val_mae:.4f}")
+
+
+    print(f"Best Config:{best_config}")
+    print(f"Best MAE: {best_val_loss}")
+
+    test_model(best_model, best_test_sets)

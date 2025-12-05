@@ -23,8 +23,8 @@ torch.backends.cudnn.benchmark = False
 # Testing different model parameters - optimizing epochs
 # Adding dropout to reduce overfitting
 configs = [
-    {"hidden_size": 64, "num_layers": 3, "max_epochs":100, "dropout":0.1}, # Try a light-weight model compare if worth it
-    {"hidden_size": 128, "num_layers": 3, "max_epochs":100, "dropout": 0.2}, # Try less layers
+    #{"hidden_size": 64, "num_layers": 3, "max_epochs":100, "dropout":0.1}, # Try a light-weight model compare if worth it
+    #{"hidden_size": 128, "num_layers": 3, "max_epochs":100, "dropout": 0.2}, # Try less layers
     {"hidden_size": 128, "num_layers": 5, "max_epochs":300, "dropout":0.2 }, # What has worked the best so far
 ]
 
@@ -131,8 +131,16 @@ def train_model(max_epochs = 300, hidden_size =128, num_layers=5, dropout=0.1):
     # Use fixed dataset: 10s without burn_in
     fixed_data_dir = os.path.join(project_root, "data")
     fixed_test_dir = os.path.join(project_root, "data", "test")
-    train_dir = os.path.join(fixed_data_dir, "data_in_10s_with_burn_in")
-    test_dir = os.path.join(fixed_test_dir, "test_in_10s")
+
+    # if using burn in:
+    burn_in = True
+
+    if burn_in:
+        train_dir = os.path.join(fixed_data_dir, "10s_with_burn_in")
+        test_dir = os.path.join(fixed_test_dir, "test_in_10s")
+    else:
+        train_dir = os.path.join(fixed_data_dir, "10s")
+        test_dir = os.path.join(fixed_test_dir, "test_in_10s")
     
     # Fallback to Data Group if fixed doesn't exist
     if not os.path.isdir(train_dir):
@@ -177,37 +185,49 @@ def train_model(max_epochs = 300, hidden_size =128, num_layers=5, dropout=0.1):
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50)
 
     best_val_loss, early_stop_counter = float('inf'), 0
-    patience, burn_in_steps = 300, 0
+    patience, burn_in_steps = 300, 30
 
     for epoch in range(max_epochs):
         model.train()
         total_train_loss = 0
+
         for batch in train_loader:
             inputs, targets, *_ = [b.to(device) if torch.is_tensor(b) else b for b in batch]
             batch_size, seq_len, _ = inputs.shape
+
             hidden = model.init_hidden(batch_size)
             optimizer.zero_grad()
 
-            if burn_in_steps > 0 and seq_len > burn_in_steps:
+            if burn_in_steps > 0:
+                burn_inputs = inputs[:, :burn_in_steps, :] # 7 feature window
                 _, hidden = model(inputs[:, :burn_in_steps], hidden)
 
-            current_t_min = inputs[:, 0, 1]  # T_outer
-            current_input_temp = inputs[:, 0, 2]  # Input Temperature
-            current_t_ave = inputs[:, 0, 3]  # T_avg
+            # After burn-in, start autoregression
+            start_t = burn_in_steps
+
+            current_t_min = inputs[:, start_t, 1]  # T_outer
+            current_input_temp = inputs[:, start_t, 2]  # Input Temperature
+            current_t_ave = inputs[:, start_t, 3]  # T_avg
+
             time_weights = torch.linspace(1, 0, seq_len, device=device)
             batch_loss = 0.0
 
-            for t in range(seq_len):
+            for t in range(start_t, seq_len):
                 input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave,
                                        inputs[:, t, 4],      # dT_outer
                                        inputs[:, t, 5],      # dInput
                                        inputs[:, t, 6],      # dT_avg
                 ], dim=1).unsqueeze(1)
+
                 delta, hidden = model(input_t, hidden)
                 # Now output is [T_inner, T_outer, T_avg] (3 values)
                 output = delta[:, 0]  # [T_inner, T_outer, T_avg] (3 values)
+
+                # loss per timestep
                 loss_t = weighted_loss(output, targets[:, t], time_weights=time_weights[t:t + 1])
                 batch_loss += loss_t
+
+                # Teacher forcing
                 if t < seq_len - 1:
                     use_teacher = (torch.rand(batch_size, device=device) < 0.5).float()
                     ground_truth = inputs[:, t + 1, 1:4]  # [T_outer, Input_Temp, T_avg]
@@ -216,39 +236,51 @@ def train_model(max_epochs = 300, hidden_size =128, num_layers=5, dropout=0.1):
                     current_input_temp = inputs[:, t + 1, 2]  # Use next Input Temperature
                     current_t_ave = use_teacher * ground_truth[:, 2] + (1 - use_teacher) * output[:, 2]  # T_avg from output[2]
 
-            (batch_loss / seq_len).backward()
+            (batch_loss / (seq_len - start_t)).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            total_train_loss += batch_loss.item() / seq_len
+
+            total_train_loss += batch_loss.item() / (seq_len - start_t)
 
         model.eval()
         with torch.no_grad():
             val_loss = 0
             for val_batch in val_loader:
                 inputs, targets, *_ = [b.to(device) if torch.is_tensor(b) else b for b in val_batch]
+                batch_size, seq_len, _ = inputs.shape
+
                 hidden = model.init_hidden(inputs.size(0))
-                if burn_in_steps > 0 and seq_len > burn_in_steps:
+
+                if burn_in_steps > 0:
+                    burn_inputs = inputs[:, :burn_in_steps, :] # Full 7 features
                     _, hidden = model(inputs[:, :burn_in_steps], hidden)
-                current_t_min = inputs[:, 0, 1]  # T_outer
-                current_input_temp = inputs[:, 0, 2]  # Input Temperature
-                current_t_ave = inputs[:, 0, 3]  # T_avg
+
+                start_t = burn_in_steps
+
+                current_t_min = inputs[:, start_t, 1]  # T_outer
+                current_input_temp = inputs[:, start_t, 2]  # Input Temperature
+                current_t_ave = inputs[:, start_t, 3]  # T_avg
                 batch_val_loss = 0
-                for t in range(seq_len):
+
+                for t in range(start_t, seq_len):
                     input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave,
                                            inputs[:, t, 4],  # dT_outer
                                            inputs[:, t, 5],  # dInput
                                            inputs[:, t, 6],  # dT_avg
                                            ], dim=1).unsqueeze(1)
                     delta, hidden = model(input_t, hidden)
+
                     output = delta[:, 0]  # [T_inner, T_outer, T_avg] (3 values)
                     loss_t = weighted_loss(output, targets[:, t])
 
                     batch_val_loss += loss_t
+
+                    # No teacher forcing during validation
                     if t < seq_len - 1:
                         current_t_min = inputs[:, t + 1, 1]  # T_outer
                         current_input_temp = inputs[:, t + 1, 2]  # Input Temperature
                         current_t_ave = inputs[:, t + 1, 3]  # T_avg
-                val_loss += batch_val_loss.item() / seq_len
+                val_loss += batch_val_loss.item() / (seq_len - start_t)
 
         ave_val_loss = val_loss / len(val_loader)
         scheduler.step(ave_val_loss)
@@ -268,7 +300,7 @@ def train_model(max_epochs = 300, hidden_size =128, num_layers=5, dropout=0.1):
     return model, test_datasets, best_val_loss
 
 # === Testing function ===
-def test_model(model, test_datasets):
+def test_model(model, test_datasets, burn_in_steps=30):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
     
@@ -283,13 +315,22 @@ def test_model(model, test_datasets):
         # print(f"Processing test case {idx+1}/{len(test_datasets)}: {file}")
         x, _, _, ft, ft_min, ft_max, ft_ave = dataset[0]
         x = x.to(device)
+        seq_len = x.shape[0]
+
         hidden = model.init_hidden(1)
-        current_t_min = x[0, 1]  # T_outer
-        current_input_temp = x[0, 2]  # Input Temperature
-        current_t_ave = x[0, 3]  # T_avg
+        if burn_in_steps > 0:
+            burn_inputs= x[ :burn_in_steps].unsqueeze(0) # shape (1, burn, 7)
+            _, hidden = model(burn_inputs, hidden)
+
+        start_t = burn_in_steps
+
+        current_t_min = x[start_t, 1]  # T_outer
+        current_input_temp = x[start_t, 2]  # Input Temperature
+        current_t_ave = x[start_t, 3]  # T_avg
+
         preds = []
 
-        for t in range(x.shape[0]):
+        for t in range(start_t, seq_len):
             input_t = torch.tensor([[
                 x[t, 0],  # Time
                 current_t_min,
@@ -299,9 +340,11 @@ def test_model(model, test_datasets):
                 x[t, 5],  # dInput Temperature
                 x[t, 6],  # dT_avg
             ]], dtype=torch.float32).unsqueeze(0).to(device)
+
             with torch.no_grad():
                 delta, hidden = model(input_t, hidden)
                 output = delta[0, 0]  # [T_inner, T_outer, T_avg] (3 values)
+
                 pred = output.cpu().numpy()
                 preds.append(pred)
                 if t < x.shape[0] - 1:
@@ -318,19 +361,20 @@ def test_model(model, test_datasets):
         # Note: pred_seq corresponds to predictions at time indices 1 to len(pred_seq)
         # Use ft[1:] to match prediction length
         dummy_actual = np.zeros((len(pred_seq), 5))
-        dummy_actual[:, 0] = ft[1:len(pred_seq)+1]  # Time (from index 1 to len(pred_seq))
-        dummy_actual[:, 1] = ft_min[1:len(pred_seq)+1]  # T_outer  
-        dummy_actual[:, 2] = ft_max[1:len(pred_seq)+1]  # T_inner
-        dummy_actual[:, 3] = ft_ave[1:len(pred_seq)+1]  # T_avg
+
+        dummy_actual[:, 0] = ft[start_t:start_t + len(pred_seq)]  # Time (from index 1 to len(pred_seq))
+        dummy_actual[:, 1] = ft_min[start_t:start_t + len(pred_seq)]  # T_outer
+        dummy_actual[:, 2] = ft_max[start_t:start_t + len(pred_seq)]  # T_inner
+        dummy_actual[:, 3] = ft_ave[start_t:start_t + len(pred_seq)]  # T_avg
         
         # Need to add Input Temperature - get from x (input train)
         # x has columns: Time, T_outer, Input_Temp, T_avg
-        dummy_actual[:, 4] = x[:, 2].cpu().numpy()  # Input Temperature
+        dummy_actual[:, 4] = x[:, 2].cpu().numpy()[start_t:start_t + len(preds)]  # Input Temperature
         
         # Predictions: pred_seq[:, 0]=T_inner, pred_seq[:, 1]=T_outer, pred_seq[:, 2]=T_avg
         # pred_seq corresponds to predictions at time indices 1 to n-1
         dummy_pred = np.zeros((len(pred_seq), 5))
-        dummy_pred[:, 0] = ft[1:len(pred_seq)+1]  # Time (from index 1 to n-1)
+        dummy_pred[:, 0] = ft[start_t:start_t + len(pred_seq)]  # Time (from index 1 to n-1)
         dummy_pred[:, 1] = pred_seq[:, 1]  # T_outer prediction
         dummy_pred[:, 2] = pred_seq[:, 0]  # T_inner prediction
         dummy_pred[:, 3] = pred_seq[:, 2]  # T_avg prediction

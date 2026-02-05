@@ -108,28 +108,25 @@ def weighted_loss(predictions, targets, weights=torch.tensor([1.0, 1.0, 1.0]), t
 def train_model():
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    possible_data_dirs = [
-        os.path.join(script_dir, "..", "..", "data"),
-        os.path.join(script_dir, "data"),
-        "data"
-    ]
+    # 1. Define Project Root (Go up 2 levels from src/models)
+    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
 
-    data_dir = None
-    for dir_path in possible_data_dirs:
-        if os.path.exists(dir_path):
-            data_dir = dir_path
-            break
+    # 2. Define paths including the 'train' and 'test' folders
+    # Structure: data -> train -> data_in_150s
+    train_dir = os.path.join(project_root, "data", "train", "data_in_150s")
+    # Structure: data -> test -> test_in_150s
+    test_dir = os.path.join(project_root, "data", "test", "test_in_150s")
 
-    if not data_dir:
-        print("Data directory not found")
+    # Debug: Print the exact paths the script is checking
+    print(f"Checking for training data at: {train_dir}")
+    print(f"Checking for test data at:     {test_dir}")
+
+    if not os.path.exists(train_dir):
+        print(f"Error: Directory not found: {train_dir}")
         return None, None
-
-    train_dir = os.path.join(data_dir, "data_in_150s")
-    test_dir = os.path.join(data_dir, "test_in_150s")
 
     train_paths = sorted(glob.glob(os.path.join(train_dir, "**", "*.csv"), recursive=True))
     test_paths = sorted(glob.glob(os.path.join(test_dir, "*.csv")))
-
     print(f"Found training files: {len(train_paths)}")
     print(f"Found test files: {len(test_paths)}")
 

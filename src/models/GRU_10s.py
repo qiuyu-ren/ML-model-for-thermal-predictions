@@ -144,8 +144,14 @@ def train_model(max_epochs=100, hidden_size=128, num_layers=5, dropout=0.1):
         print("Data directory not found")
         return None, None, float('inf'), [], []
 
-    train_dir = os.path.join(data_dir, "data_in_10s")
-    test_dir = os.path.join(data_dir, "test_in_10s")
+    # Check for nested structure (local environment)
+    if os.path.exists(os.path.join(data_dir, "fixed")):
+        train_dir = os.path.join(data_dir, "fixed", "data", "data_in_10s")
+        test_dir = os.path.join(data_dir, "fixed", "test_with_inputs", "test_in_10s")
+    else:
+        # Flat structure (Colab or original assumption)
+        train_dir = os.path.join(data_dir, "data_in_10s")
+        test_dir = os.path.join(data_dir, "test_in_10s")
 
     train_paths = sorted(glob.glob(os.path.join(train_dir, "**", "*.csv"), recursive=True))
     test_paths = sorted(glob.glob(os.path.join(test_dir, "*.csv")))
@@ -535,14 +541,20 @@ if __name__ == "__main__":
     print(f"{'=' * 60}")
     print(f"{'Dropout':<12} {'Final Val Loss':<20} {'Epochs Run':<15}")
     print(f"{'-' * 60}")
-    for result in all_results:
-        dropout = result['config']['dropout']
-        final_loss = result['final_val_loss']
-        epochs = len(result['val_loss'])
-        marker = " <-- BEST" if dropout == best_config['dropout'] else ""
-        print(f"{dropout:<12.2f} {final_loss:<20.6f} {epochs:<15}{marker}")
+    if best_config:
+        for result in all_results:
+            dropout = result['config']['dropout']
+            final_loss = result['final_val_loss']
+            epochs = len(result['val_loss'])
+            marker = " <-- BEST" if dropout == best_config['dropout'] else ""
+            print(f"{dropout:<12.2f} {final_loss:<20.6f} {epochs:<15}{marker}")
+    else:
+        print("No successful training runs completed.")
     print(f"{'=' * 60}\n")
 
     # Test the best model
-    print("Testing best model...")
-    test_model(best_model, best_test_sets)
+    if best_model:
+        print("Testing best model...")
+        test_model(best_model, best_test_sets)
+    else:
+        print("Skipping testing as no model was trained.")

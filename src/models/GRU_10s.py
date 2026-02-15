@@ -208,20 +208,29 @@ def train_model(max_epochs=100, hidden_size=128, num_layers=5, dropout=0.1):
             optimizer.zero_grad()
 
             if burn_in_steps > 0:
-                burn_inputs = inputs[:, :burn_in_steps, :]
-                _, hidden = model(inputs[:, :burn_in_steps], hidden)
+                burn_inputs = inputs[:, 0:1, :].expand(-1, burn_in_steps, -1).clone()
+                burn_inputs[:, :, 0] = inputs[:, :burn_in_steps, 0]
+                _, hidden = model(burn_inputs, hidden)
 
-            start_t = burn_in_steps
+            # Calculate scaled time step (assuming linear spacing)
+            # Use the gap between step 0 and step 1 as the delta
+            dt_scaled = inputs[:, 1, 0] - inputs[:, 0, 0]
+            # Reshape for broadcasting if needed, though (batch,) matches behavior
+            # Add scaled burn-in time
+            burn_in_time_scaled = dt_scaled * burn_in_steps
 
-            current_t_min = inputs[:, start_t, 1]  # T_outer
-            current_input_temp = inputs[:, start_t, 2]  # Input Temperature
-            current_t_ave = inputs[:, start_t, 3]  # T_avg
+            current_t_min = inputs[:, 0, 1]  # T_outer
+            current_input_temp = inputs[:, 0, 2]  # Input Temperature
+            current_t_ave = inputs[:, 0, 3]  # T_avg
 
             time_weights = torch.linspace(1, 0, seq_len, device=device)
             batch_loss = 0.0
 
-            for t in range(start_t, seq_len):
-                input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave,
+            for t in range(0, seq_len):
+                # Add scaled burn-in time to the input time channel
+                t_input = inputs[:, t, 0] + burn_in_time_scaled
+                
+                input_t = torch.stack([t_input, current_t_min, current_input_temp, current_t_ave,
                                        inputs[:, t, 4],  # dT_outer
                                        inputs[:, t, 5],  # dInput
                                        inputs[:, t, 6],  # dT_avg
@@ -241,11 +250,11 @@ def train_model(max_epochs=100, hidden_size=128, num_layers=5, dropout=0.1):
                     current_input_temp = inputs[:, t + 1, 2]
                     current_t_ave = use_teacher * ground_truth[:, 2] + (1 - use_teacher) * output[:, 2]
 
-            (batch_loss / (seq_len - start_t)).backward()
+            (batch_loss / seq_len).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            total_train_loss += batch_loss.item() / (seq_len - start_t)
+            total_train_loss += batch_loss.item() / seq_len
 
         model.eval()
         with torch.no_grad():
@@ -257,18 +266,21 @@ def train_model(max_epochs=100, hidden_size=128, num_layers=5, dropout=0.1):
                 hidden = model.init_hidden(inputs.size(0))
 
                 if burn_in_steps > 0:
-                    burn_inputs = inputs[:, :burn_in_steps, :]
-                    _, hidden = model(inputs[:, :burn_in_steps], hidden)
+                    burn_inputs = inputs[:, 0:1, :].expand(-1, burn_in_steps, -1).clone()
+                    burn_inputs[:, :, 0] = inputs[:, :burn_in_steps, 0]
+                    _, hidden = model(burn_inputs, hidden)
 
-                start_t = burn_in_steps
+                dt_scaled = inputs[:, 1, 0] - inputs[:, 0, 0]
+                burn_in_time_scaled = dt_scaled * burn_in_steps
 
-                current_t_min = inputs[:, start_t, 1]
-                current_input_temp = inputs[:, start_t, 2]
-                current_t_ave = inputs[:, start_t, 3]
+                current_t_min = inputs[:, 0, 1]
+                current_input_temp = inputs[:, 0, 2]
+                current_t_ave = inputs[:, 0, 3]
                 batch_val_loss = 0
 
-                for t in range(start_t, seq_len):
-                    input_t = torch.stack([inputs[:, t, 0], current_t_min, current_input_temp, current_t_ave,
+                for t in range(0, seq_len):
+                    t_input = inputs[:, t, 0] + burn_in_time_scaled
+                    input_t = torch.stack([t_input, current_t_min, current_input_temp, current_t_ave,
                                            inputs[:, t, 4],
                                            inputs[:, t, 5],
                                            inputs[:, t, 6],
@@ -284,7 +296,7 @@ def train_model(max_epochs=100, hidden_size=128, num_layers=5, dropout=0.1):
                         current_t_min = inputs[:, t + 1, 1]
                         current_input_temp = inputs[:, t + 1, 2]
                         current_t_ave = inputs[:, t + 1, 3]
-                val_loss += batch_val_loss.item() / (seq_len - start_t)
+                val_loss += batch_val_loss.item() / seq_len
 
         ave_train_loss = total_train_loss / len(train_loader)
         ave_val_loss = val_loss / len(val_loader)
@@ -327,10 +339,15 @@ def test_model(model, test_datasets, burn_in_steps=30):
 
         hidden = model.init_hidden(1)
         if burn_in_steps > 0:
-            burn_inputs = x[:burn_in_steps].unsqueeze(0)
+            burn_inputs = x[0:1].expand(burn_in_steps, -1).clone()
+            burn_inputs[:, 0] = x[:burn_in_steps, 0]
+            burn_inputs = burn_inputs.unsqueeze(0)
             _, hidden = model(burn_inputs, hidden)
 
-        start_t = burn_in_steps
+        dt_scaled = x[1, 0] - x[0, 0]
+        burn_in_time_scaled = dt_scaled * burn_in_steps
+        
+        start_t = 0 # Testing full sequence from 0
 
         current_t_min = x[start_t, 1]
         current_input_temp = x[start_t, 2]
@@ -339,8 +356,9 @@ def test_model(model, test_datasets, burn_in_steps=30):
         preds = []
 
         for t in range(start_t, seq_len):
+            t_input = x[t, 0] + burn_in_time_scaled
             input_t = torch.tensor([[
-                x[t, 0],
+                t_input,
                 current_t_min,
                 current_input_temp,
                 current_t_ave,
@@ -363,6 +381,7 @@ def test_model(model, test_datasets, burn_in_steps=30):
         pred_seq = np.array(preds)
 
         dummy_actual = np.zeros((len(pred_seq), 5))
+        # Use full range from start_t (0) since we are predicting for all steps
         dummy_actual[:, 0] = ft[start_t:start_t + len(pred_seq)]
         dummy_actual[:, 1] = ft_min[start_t:start_t + len(pred_seq)]
         dummy_actual[:, 2] = ft_max[start_t:start_t + len(pred_seq)]

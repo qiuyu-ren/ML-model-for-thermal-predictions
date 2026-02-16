@@ -214,3 +214,4 @@ def test_pinn(model, scaler):
 if __name__ == "__main__":
     m, s = train_pinn()
     test_pinn(m, s)
+

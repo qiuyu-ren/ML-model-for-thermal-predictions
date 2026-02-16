@@ -344,11 +344,41 @@ def test_model(model, test_datasets, burn_in_steps=30):
         seq_len = x.shape[0]
 
         hidden = model.init_hidden(1)
+        burn_in_preds = []
         if burn_in_steps > 0:
-            burn_inputs = x[0:1].expand(burn_in_steps, -1).clone()
-            burn_inputs[:, 0] = x[:burn_in_steps, 0]
-            burn_inputs = burn_inputs.unsqueeze(0)
-            _, hidden = model(burn_inputs, hidden)
+            # Run step-by-step burn-in to capture predictions
+            # Use duplicated step 0 with incrementing time
+            dt_scaled = x[1, 0] - x[0, 0]
+            
+            # Initial conditions from step 0
+            current_t_min = x[0, 1]
+            current_input_temp = x[0, 2]
+            current_t_ave = x[0, 3]
+
+            for t_step in range(burn_in_steps):
+                time_val = t_step * dt_scaled # Time starts at 0 relative to sequence start? 
+                # Yes, burn in is 0, 10... 290. Main sequence starts effectively at 300.
+                
+                # Input vector shape (1, 1, 7) for single step
+                # Features: Time, T_outer, Input, T_avg, dT...
+                # We duplicate x[0] features but update time
+                input_t = x[0:1].clone() # Shape (1, 7)
+                input_t[0, 0] = x[0, 0] + time_val # Update time
+                input_t = input_t.unsqueeze(0) # (1, 1, 7)
+                
+                with torch.no_grad():
+                     delta, hidden = model(input_t, hidden)
+                     output = delta[0, 0]
+                     burn_in_preds.append(output.cpu().numpy())
+                     
+                     # Update feedback loop for burn-in?
+                     # The request is "burn_in of dups of timestep 0". 
+                     # So inputs should stay constant x[0] except time.
+                     # We DON'T update current_* from output for the NEXT input in burn-in,
+                     # because that would be autoregressive simulation starting from constant.
+                     # The user said "burn_in of dups of timestep 0".
+                     # So inputs are fixed to x[0].
+                     pass
 
         dt_scaled = x[1, 0] - x[0, 0]
         burn_in_time_scaled = dt_scaled * burn_in_steps
@@ -384,43 +414,117 @@ def test_model(model, test_datasets, burn_in_steps=30):
                     current_input_temp = x[t + 1, 2]
                     current_t_ave = pred[2]
 
-        pred_seq = np.array(preds)
+        # === Construct prediction arrays for plotting ===
+        pred_seq = np.array(preds)  # Main predictions: shape (seq_len, 3) = [T_inner, T_outer, T_avg]
+        burn_in_seq = np.array(burn_in_preds)  # Burn-in predictions: shape (burn_in_steps, 3)
 
-        dummy_actual = np.zeros((len(pred_seq), 5))
-        # Use full range from start_t (0) since we are predicting for all steps
-        dummy_actual[:, 0] = ft[start_t:start_t + len(pred_seq)]
-        dummy_actual[:, 1] = ft_min[start_t:start_t + len(pred_seq)]
-        dummy_actual[:, 2] = ft_max[start_t:start_t + len(pred_seq)]
-        dummy_actual[:, 3] = ft_ave[start_t:start_t + len(pred_seq)]
-        dummy_actual[:, 4] = x[:, 2].cpu().numpy()[start_t:start_t + len(preds)]
+        # Prepend known t=0 anchor to main predictions
+        # ft_max = scaled T_inner, x[:,1] = scaled T_outer, x[:,3] = scaled T_avg
+        known_t0 = np.array([[ft_max[start_t], x[start_t, 1].cpu().item(), x[start_t, 3].cpu().item()]])
+        main_pred_with_anchor = np.concatenate([known_t0, pred_seq], axis=0)  # shape (seq_len+1, 3)
 
-        dummy_pred = np.zeros((len(pred_seq), 5))
-        dummy_pred[:, 0] = ft[start_t:start_t + len(pred_seq)]
-        dummy_pred[:, 1] = pred_seq[:, 1]
-        dummy_pred[:, 2] = pred_seq[:, 0]
-        dummy_pred[:, 3] = pred_seq[:, 2]
-        dummy_pred[:, 4] = x[:, 2].cpu().numpy()[start_t:start_t + len(preds)]
+        # Combine burn-in + main predictions
+        if len(burn_in_seq) > 0:
+            all_pred = np.concatenate([burn_in_seq, main_pred_with_anchor], axis=0)
+        else:
+            all_pred = main_pred_with_anchor
 
+        total_len = len(all_pred)
+
+        # === Construct time axis (unscaled, for plotting) ===
+        # ft = full_time = scaled time values for the FULL original sequence (length N)
+        # We need to inverse_transform ft to get real seconds.
+        # Scaler columns: [Time, T_outer, T_inner, T_avg, Input_Temp]
+        # To inverse_transform just Time, we pad with zeros for the other 4 columns.
+        ft_for_inv = np.zeros((len(ft), 5))
+        ft_for_inv[:, 0] = ft
+        real_time = dataset.scaler.inverse_transform(ft_for_inv)[:, 0]  # Unscaled time in seconds
+
+        original_dt = real_time[1] - real_time[0]  # Should be ~10s
+        burn_in_duration = burn_in_steps * original_dt
+
+        # Burn-in time: 0, 10, 20, ... 290
+        t_burn_in = np.arange(burn_in_steps) * original_dt
+        # Main time: shifted by burn-in duration
+        # main_pred_with_anchor has (seq_len+1) points, matching ft[0:seq_len+1]
+        # But ft has N elements (full sequence), and seq_len = N-1 (x has N-1 rows)
+        # So main_pred_with_anchor has N points, matching ft[0:N] = all of ft
+        t_main = real_time[start_t : start_t + len(main_pred_with_anchor)] + burn_in_duration
+
+        plot_time = np.concatenate([t_burn_in, t_main])
+
+        # === Construct "Actual" arrays (scaled, for inverse_transform) ===
+        dummy_actual = np.zeros((total_len, 5))
+        dummy_actual[:, 0] = plot_time  # Will be overwritten by inverse_transform anyway
+
+        # Burn-in "actual": constant initial values
+        val_outer = x[0, 1].cpu().item()
+        val_inner = ft_max[0]
+        val_avg = x[0, 3].cpu().item()
+        val_input = x[0, 2].cpu().item()
+
+        if burn_in_steps > 0:
+            dummy_actual[:burn_in_steps, 1] = val_outer
+            dummy_actual[:burn_in_steps, 2] = val_inner
+            dummy_actual[:burn_in_steps, 3] = val_avg
+            dummy_actual[:burn_in_steps, 4] = val_input
+
+        # Main "actual": from dataset
+        # ft_min (T_outer), ft_max (T_inner), ft_ave (T_avg) have length N (full sequence)
+        # main_pred_with_anchor has length N (seq_len+1 = N)
+        # x has length N-1, so for Input Temp we need ft values instead
+        n_main = len(main_pred_with_anchor)
+        dummy_actual[burn_in_steps:, 1] = ft_min[start_t : start_t + n_main]
+        dummy_actual[burn_in_steps:, 2] = ft_max[start_t : start_t + n_main]
+        dummy_actual[burn_in_steps:, 3] = ft_ave[start_t : start_t + n_main]
+        # For Input Temp: x has N-1 rows, but we need N values
+        # Use x[:, 2] for first N-1 values, repeat last value for the Nth
+        input_temp_scaled = x[:, 2].cpu().numpy()
+        input_temp_padded = np.append(input_temp_scaled, input_temp_scaled[-1])
+        dummy_actual[burn_in_steps:, 4] = input_temp_padded[start_t : start_t + n_main]
+
+        # === Construct "Predicted" arrays (scaled, for inverse_transform) ===
+        dummy_pred = np.zeros((total_len, 5))
+        dummy_pred[:, 0] = plot_time
+        dummy_pred[:, 1] = all_pred[:, 1]  # T_outer (index 1 in model output)
+        dummy_pred[:, 2] = all_pred[:, 0]  # T_inner (index 0 in model output)
+        dummy_pred[:, 3] = all_pred[:, 2]  # T_avg   (index 2 in model output)
+        dummy_pred[:, 4] = dummy_actual[:, 4]  # Input Temp (same as actual)
+
+        # === Inverse transform to get real temperatures ===
         inv_pred = dataset.scaler.inverse_transform(dummy_pred)
         inv_actual = dataset.scaler.inverse_transform(dummy_actual)
 
-        mae_inner = np.mean(np.abs(inv_actual[:, 2] - inv_pred[:, 2]))
-        mae_outer = np.mean(np.abs(inv_actual[:, 1] - inv_pred[:, 1]))
-        mae_avg = np.mean(np.abs(inv_actual[:, 3] - inv_pred[:, 3]))
+        # Overwrite time column with our constructed plot_time (already in real seconds)
+        inv_pred[:, 0] = plot_time
+        inv_actual[:, 0] = plot_time
 
-        plt.figure(figsize=(10, 6))
-        plt.plot(inv_actual[:, 0], inv_actual[:, 1], label="T_outer Actual", color="blue")
-        plt.plot(inv_pred[:, 0], inv_pred[:, 1], "--", label="T_outer Pred", color="blue")
-        plt.plot(inv_actual[:, 0], inv_actual[:, 3], label="T_avg Actual", color="green")
-        plt.plot(inv_pred[:, 0], inv_pred[:, 3], "--", label="T_avg Pred", color="green")
-        plt.plot(inv_actual[:, 0], inv_actual[:, 2], label="T_inner Actual", color="red")
-        plt.plot(inv_pred[:, 0], inv_pred[:, 2], "--", label="T_inner Pred", color="red")
+        # === Calculate MAE on MAIN sequence only (after burn-in) ===
+        mae_inner = np.mean(np.abs(inv_actual[burn_in_steps:, 2] - inv_pred[burn_in_steps:, 2]))
+        mae_outer = np.mean(np.abs(inv_actual[burn_in_steps:, 1] - inv_pred[burn_in_steps:, 1]))
+        mae_avg = np.mean(np.abs(inv_actual[burn_in_steps:, 3] - inv_pred[burn_in_steps:, 3]))
+
+        # === Plot (main sequence only, skip burn-in) ===
+        pa = inv_actual[burn_in_steps:]
+        pp = inv_pred[burn_in_steps:]
+
+        plt.figure(figsize=(12, 6))
+
+        plt.plot(pa[:, 0], pa[:, 1], label="T_outer Actual", color="blue", alpha=0.6)
+        plt.plot(pp[:, 0], pp[:, 1], "--", label="T_outer Pred", color="blue")
+
+        plt.plot(pa[:, 0], pa[:, 3], label="T_avg Actual", color="green", alpha=0.6)
+        plt.plot(pp[:, 0], pp[:, 3], "--", label="T_avg Pred", color="green")
+
+        plt.plot(pa[:, 0], pa[:, 2], label="T_inner Actual", color="red", alpha=0.6)
+        plt.plot(pp[:, 0], pp[:, 2], "--", label="T_inner Pred", color="red")
+
         plt.xlabel("Time (s)")
-        plt.ylabel("Temperature (C)")
+        plt.ylabel("Temperature (°C)")
         plt.title(f"Prediction - {file}")
         plt.legend()
 
-        mae_text = f"MAE: T_inner={mae_inner:.3f}°C, T_outer={mae_outer:.3f}°C, T_avg={mae_avg:.3f}°C"
+        mae_text = f"MAE (Main): T_inner={mae_inner:.3f}°C, T_outer={mae_outer:.3f}°C, T_avg={mae_avg:.3f}°C"
         plt.text(0.02, 0.98, mae_text, transform=plt.gca().transAxes,
                  verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
                  fontsize=9)
@@ -429,6 +533,22 @@ def test_model(model, test_datasets, burn_in_steps=30):
         output_path = os.path.join(output_dir, f"plot_{file}.png")
         plt.savefig(output_path, dpi=150, bbox_inches='tight')
         plt.close()
+
+        # Save plotted data to CSV
+        csv_output_dir = os.path.join(script_dir, "GRU_10s_with_burn_in")
+        os.makedirs(csv_output_dir, exist_ok=True)
+        csv_data = pd.DataFrame({
+            'Time (s)': plot_time,
+            'T_outer Actual (C)': inv_actual[:, 1],
+            'T_inner Actual (C)': inv_actual[:, 2],
+            'T_avg Actual (C)': inv_actual[:, 3],
+            'T_outer Pred (C)': inv_pred[:, 1],
+            'T_inner Pred (C)': inv_pred[:, 2],
+            'T_avg Pred (C)': inv_pred[:, 3],
+        })
+        csv_path = os.path.join(csv_output_dir, f"test_case({idx + 1}).csv")
+        csv_data.to_csv(csv_path, index=False)
+
 
     print(f"\nAll plots saved to: {output_dir}")
 

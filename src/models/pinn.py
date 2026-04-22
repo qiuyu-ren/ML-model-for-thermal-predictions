@@ -31,11 +31,11 @@ class PhysicsLoss(nn.Module):
         self.register_buffer("s_scale", torch.tensor(scaler_scale, dtype=torch.float32))
 
     def unscale(self, Ti_s, To_s, Ta_s, Text_s):
-        # Indices: [0:Time, 1:To, 2:Ti, 3:Ta, 4:Input]
-        Ti = Ti_s * self.s_scale[2] + self.s_min[2]
-        To = To_s * self.s_scale[1] + self.s_min[1]
-        Ta = Ta_s * self.s_scale[3] + self.s_min[3]
-        Text = Text_s * self.s_scale[4] + self.s_min[4]
+        # Inverse of MinMaxScaler: X = (X_scaled - min_) / scale_
+        Ti = (Ti_s - self.s_min[2]) / self.s_scale[2]
+        To = (To_s - self.s_min[1]) / self.s_scale[1]
+        Ta = (Ta_s - self.s_min[3]) / self.s_scale[3]
+        Text = (Text_s - self.s_min[4]) / self.s_scale[4]
         return Ti, To, Ta, Text
 
     def get_alpha(self, T):
@@ -54,7 +54,9 @@ class PhysicsLoss(nn.Module):
         Ti_c, To_c, Ta_c, Tin_c = Ti[:, 1:], To[:, 1:], Ta[:, 1:], Tin[:, 1:]
         alpha_i, alpha_o, alpha_a = self.get_alpha(Ti_c), self.get_alpha(To_c), self.get_alpha(Ta_c)
 
-        x = torch.sigmoid(self.x_raw) * self.d
+        safe_fraction = 0.1 + 0.8 * torch.sigmoid(self.x_raw)
+        x = safe_fraction * self.d
+        dist_outer = self.d - x
         dist_outer = self.d - x
 
         res_inner = dTi_dt - alpha_i * ((Tin_c - Ti_c) / (self.w**2))
@@ -62,9 +64,10 @@ class PhysicsLoss(nn.Module):
         res_outer = dTo_dt - alpha_o * ((Ti_c - To_c) / (self.d**2) + (Ta_c - To_c) / (dist_outer**2))
 
         loss_ode = torch.mean(res_inner**2 + res_avg**2 + res_outer**2)
-        penalty = torch.mean(torch.relu(torch.min(Ti_c, To_c) - Ta_c) + torch.relu(Ta_c - torch.max(Ti_c, To_c)))
+        penalty_term = torch.relu(torch.min(Ti_c, To_c) - Ta_c) + torch.relu(Ta_c - torch.max(Ti_c, To_c))
+        loss_penalty = torch.mean(penalty_term**2)
 
-        return loss_ode + (10.0 * penalty)
+        return loss_ode + loss_penalty
 
 # === 2. Dataset with Full State Inputs ===
 class ThermalWindowDataset(Dataset):
@@ -77,7 +80,7 @@ class ThermalWindowDataset(Dataset):
 
         for df in all_dfs:
             data = self.scaler.transform(df[cols])
-            for i in range(0, len(data) - window_size, 5):
+            for i in range(0, len(data) - window_size, 1):
                 # Input Size 5: [Time, Ti, To, Ta, Input]
                 self.X.append(data[i : i + window_size, [0, 2, 1, 3, 4]])
                 # Target Size 3: [Ti, To, Ta]
@@ -118,20 +121,24 @@ def train_pinn():
         {'params': phys_fn.parameters(), 'lr': 0.01}
     ])
 
-    lambda_phys, lambda_ic = 0.5, 2.0
-    epochs = 100
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15)
+
+    lambda_phys, lambda_ic = 0.001, 1.0
+    epochs = 300
 
     print("Starting Training...")
     for epoch in range(epochs):
         model.train()
         total_d, total_p = 0, 0
+        total_combined = 0  # --- ADDED: Track combined loss for scheduler ---
+
         for bx, by in train_loader:
             bx, by = bx.to(device), by.to(device)
             optimizer.zero_grad()
 
             batch_preds = []
             h = None
-            curr_input = bx[:, 0:1, :] 
+            curr_input = bx[:, 0:1, :]
 
             for t in range(bx.size(1)):
                 out, h = model(curr_input, h)
@@ -143,21 +150,33 @@ def train_pinn():
                         curr_input = bx[:, t+1:t+2, :]
 
             preds = torch.cat(batch_preds, dim=1)
-            
+
             loss_data = torch.mean((preds - by)**2)
-            # Initial Condition Loss: Penalize first prediction error relative to start
             loss_ic = torch.mean((preds[:, 0, :] - by[:, 0, :])**2)
             loss_phys = phys_fn(preds, bx[:, :, 4])
 
             total_loss = loss_data + (lambda_phys * loss_phys) + (lambda_ic * loss_ic)
             total_loss.backward()
+
+            # Gradient clipping (from previous step)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
 
             total_d += loss_data.item()
             total_p += loss_phys.item()
+            total_combined += total_loss.item() # --- ADDED ---
+
+        # --- ADDED: Step the scheduler at the end of the epoch ---
+        avg_epoch_loss = total_combined / len(train_loader)
+        scheduler.step(avg_epoch_loss)
 
         if epoch % 10 == 0 or epoch == epochs - 1:
-            print(f"Epoch {epoch:03d} | Data Loss: {total_d/len(train_loader):.6f} | Phys Loss: {total_p/len(train_loader):.6f}")
+            # --- ADDED: Get current Learning Rate for printing ---
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch:03d} | Data Loss: {total_d/len(train_loader):.6f} | Phys Loss: {total_p/len(train_loader):.6f} | LR: {current_lr:.6f}")
+    learned_fraction = 0.1 + 0.8 * torch.sigmoid(phys_fn.x_raw).item()
+    print(f"The PINN placed the T_avg sensor at {learned_fraction * 100:.2f}% of the wall thickness.")
 
     return model, dataset.scaler
 
@@ -170,9 +189,13 @@ def test_pinn(model, scaler):
     test_paths = sorted(glob.glob(os.path.join(test_dir, "**", "*.csv"), recursive=True))
     output_dir = os.path.join(cwd, "results", "PINN_Final")
     os.makedirs(output_dir, exist_ok=True)
+
     all_mae_inner = []
     all_mae_outer = []
     all_mae_avg = []
+
+    # --- ADDED: CSV STORAGE ---
+    csv_results = []
 
     cols = ['Time (s)', 'T_outer (C)', 'T_inner (C)', 'T_avg (C)', 'Input Temperature (C)']
 
@@ -180,10 +203,9 @@ def test_pinn(model, scaler):
         df = pd.read_csv(path).rename(columns={"T_ave (C)": "T_avg (C)"})
         scaled_data = scaler.transform(df[cols])
 
-        # State at t=0 (Ti, To, Ta)
         initial_state = scaled_data[0, [2, 1, 3]]
-        preds = [initial_state] # Start predictions list with the ground truth at t=0
-        
+        preds = [initial_state]
+
         curr_in = torch.tensor(scaled_data[0, [0, 2, 1, 3, 4]], dtype=torch.float32).view(1, 1, 5).to(device)
         h = None
 
@@ -192,30 +214,38 @@ def test_pinn(model, scaler):
                 out, h = model(curr_in, h)
                 p = out.cpu().squeeze().numpy()
                 preds.append(p)
-                # Recursive update using predicted Ti, To, Ta
-                curr_in = torch.tensor([scaled_data[t+1, 0], p[0], p[1], p[2], scaled_data[t+1, 4]], 
+                curr_in = torch.tensor([scaled_data[t+1, 0], p[0], p[1], p[2], scaled_data[t+1, 4]],
                                        dtype=torch.float32).view(1, 1, 5).to(device)
 
         preds = np.array(preds)
-        actuals = scaled_data # Keep full length including t=0
+        actuals = scaled_data
 
         def unscale(pred_arr, actual_arr):
             p_dummy, a_dummy = np.zeros((len(pred_arr), 5)), np.zeros((len(actual_arr), 5))
-            p_dummy[:, [0, 2, 1, 3, 4]] = actual_arr[:, [0, 2, 1, 3, 4]] # Map cols for inverse
-            p_dummy[:, [2, 1, 3]] = pred_arr # Overwrite Ti, To, Ta with predictions
+            p_dummy[:, [0, 2, 1, 3, 4]] = actual_arr[:, [0, 2, 1, 3, 4]]
+            p_dummy[:, [2, 1, 3]] = pred_arr
             a_dummy[:, :] = actual_arr
             return scaler.inverse_transform(p_dummy), scaler.inverse_transform(a_dummy)
 
         inv_p, inv_a = unscale(preds, actuals)
         time = inv_a[:, 0]
 
-        # Calculate MAE skipping t=0 to see model performance
         m_inner = np.mean(np.abs(inv_p[1:, 2] - inv_a[1:, 2]))
         m_outer = np.mean(np.abs(inv_p[1:, 1] - inv_a[1:, 1]))
         m_avg   = np.mean(np.abs(inv_p[1:, 3] - inv_a[1:, 3]))
         all_mae_inner.append(m_inner)
         all_mae_outer.append(m_outer)
         all_mae_avg.append(m_avg)
+
+        # --- ADDED: APPEND TO CSV DATA ---
+        csv_results.append({
+            "File": os.path.basename(path),
+            "Inner_MAE": m_inner,
+            "Avg_MAE": m_avg,
+            "Outer_MAE": m_outer,
+            "Mean_MAE": (m_inner + m_outer + m_avg) / 3
+        })
+
         plt.figure(figsize=(12, 7))
         plt.plot(time, inv_a[:, 4], 'k--', alpha=0.5, label="Input Temp (T_input)")
         plt.plot(time, inv_a[:, 2], 'r-', label=f"Actual Inner (MAE: {m_inner:.2f})")
@@ -225,11 +255,15 @@ def test_pinn(model, scaler):
         plt.plot(time, inv_a[:, 3], 'g-', label=f"Actual Avg (MAE: {m_avg:.2f})")
         plt.plot(time, inv_p[:, 3], 'g--', label="Pred Avg")
 
-        plt.title(f"File: {os.path.basename(path)} ")
+        plt.title(f"File: {os.path.basename(path)}")
         plt.xlabel("Time (s)"); plt.ylabel("Temperature (°C)"); plt.legend(bbox_to_anchor=(1.05, 1)); plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, f"{os.path.basename(path)}.png"))
         plt.close()
+
+    # --- ADDED: SAVE CSV ---
+    pd.DataFrame(csv_results).to_csv(os.path.join(output_dir, "test_mae_results.csv"), index=False)
+
     avg_inner = np.mean(all_mae_inner)
     avg_outer = np.mean(all_mae_outer)
     avg_avg = np.mean(all_mae_avg)
